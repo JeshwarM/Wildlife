@@ -387,6 +387,10 @@ def build_heatmap(df: pd.DataFrame, risk_col: str = "danger_index") -> folium.Ma
     if df.empty or "lat" not in df.columns or "lon" not in df.columns:
         return folium.Map(location=[20, 0], zoom_start=2, tiles="CartoDB positron")
 
+    # Prevent browser freezes and blank maps by capping the number of plotted points
+    if len(df) > 5000:
+        df = df.sample(n=5000, random_state=42)
+
     center_lat = df["lat"].median()
     center_lon = df["lon"].median()
 
@@ -553,7 +557,7 @@ def render_citizen(df: pd.DataFrame, filtered: pd.DataFrame, models: dict):
         st.info("No records match the current filters. Adjust the sidebar controls.")
     else:
         m = build_heatmap(filtered, risk_col="danger_index")
-        st_folium(m, width="100%", height=520, returned_objects=[])
+        st_folium(m, use_container_width=True, height=520, returned_objects=[])
 
     # Monthly trend chart
     if not df.empty and "month" in df.columns and "count" in df.columns:
@@ -679,7 +683,7 @@ def render_forecast_tab(hotspots: pd.DataFrame, df: pd.DataFrame):
                 ).add_to(m)
             except Exception:
                 pass
-    st_folium(m, width="100%", height=480, returned_objects=[])
+    st_folium(m, use_container_width=True, height=480, returned_objects=[])
 
     st.markdown("---")
     st.markdown("### Top 20 Identified Future Hotspots")
@@ -833,7 +837,7 @@ def render_authority(df: pd.DataFrame, filtered: pd.DataFrame, hotspots: pd.Data
     st.markdown("### Live Incident Heatmap")
     if not filtered.empty:
         m = build_heatmap(filtered, risk_col="danger_index")
-        st_folium(m, width="100%", height=460, returned_objects=[])
+        st_folium(m, use_container_width=True, height=460, returned_objects=[])
     else:
         st.info("No records match the current filters.")
 
