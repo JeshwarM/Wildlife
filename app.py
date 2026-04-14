@@ -617,8 +617,8 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
                 with st.spinner("Generating response..."):
                     ok, response_text = call_llm(messages, max_tokens=max_tokens, temperature=temperature)
                 if ok:
-                    rendered = st.write_stream(stream_chunks(response_text))
-                    st.session_state.ai_chat_history.append({"role": "assistant", "content": str(rendered).strip()})
+                    st.write_stream(stream_chunks(response_text))
+                    st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text.strip()})
                 else:
                     fallback = (
                         f"{response_text}\n\n"
