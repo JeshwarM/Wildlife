@@ -49,6 +49,7 @@ AI_MIN_REQUEST_INTERVAL_SEC = 3
 AI_MAX_PROMPT_CHARS = 4000
 AI_MAX_CONTEXT_CHARS = 2500
 AI_CHAT_HISTORY_WINDOW = 8
+AI_TOKEN_STEP = 32
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -480,10 +481,26 @@ def build_ai_context(current_page: str, filtered: pd.DataFrame, include_schema: 
         context["data_schema"] = schema
 
     if manual_context:
-        context["user_context"] = sanitize_text(manual_context[:AI_MAX_CONTEXT_CHARS])
+        safe_manual = sanitize_text(manual_context)
+        context["user_context"] = safe_manual[:AI_MAX_CONTEXT_CHARS]
 
     context_json = json.dumps(context, ensure_ascii=False)
-    return context_json[:AI_MAX_CONTEXT_CHARS]
+    if len(context_json) <= AI_MAX_CONTEXT_CHARS:
+        return context_json
+
+    context.pop("data_schema", None)
+    context_json = json.dumps(context, ensure_ascii=False)
+    if len(context_json) <= AI_MAX_CONTEXT_CHARS:
+        return context_json
+
+    if "user_context" in context:
+        context["user_context"] = context["user_context"][:400]
+    context_json = json.dumps(context, ensure_ascii=False)
+    if len(context_json) <= AI_MAX_CONTEXT_CHARS:
+        return context_json
+
+    minimal = {"page": current_page, "note": "Context trimmed due to size limits."}
+    return json.dumps(minimal, ensure_ascii=False)
 
 
 def is_allowed_ai_host(url: str) -> bool:
@@ -565,7 +582,7 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
         include_filters = c1.checkbox("Include filters", value=True)
         include_schema = c2.checkbox("Include dataset schema", value=False)
 
-        max_tokens = st.slider("Response token cap", min_value=128, max_value=800, value=350, step=32)
+        max_tokens = st.slider("Response token cap", min_value=128, max_value=800, value=350, step=AI_TOKEN_STEP)
         temperature = st.slider("Creativity", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
         manual_context = st.text_area(
             "Optional extra context",
@@ -622,7 +639,7 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
                     ok, response_text = call_llm(messages, max_tokens=max_tokens, temperature=temperature)
                 if ok:
                     st.write_stream(stream_chunks(response_text))
-                    st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text.strip()})
+                    st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text})
                 else:
                     fallback = (
                         f"{response_text}\n\n"
