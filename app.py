@@ -7,6 +7,12 @@ Amber/Dark Theme | Folium Heatmap | SHAP Explainability | Future Forecasting
 import os
 import warnings
 import io
+import json
+import re
+import time
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 import numpy as np
 import pandas as pd
@@ -34,6 +40,19 @@ XGB_PATH        = os.path.join(MODELS_DIR, "xgb_expert.pkl")
 META_PATH       = os.path.join(MODELS_DIR, "meta_judge.pkl")
 LE_PATH         = os.path.join(MODELS_DIR, "label_encoders.pkl")
 FEEDBACK_PATH   = os.path.join(BASE_DIR, "officer_feedback.csv")
+
+AI_DEFAULT_BASE_URL = "https://api.openai.com/v1/chat/completions"
+AI_DEFAULT_MODEL = "gpt-4o-mini"
+AI_ALLOWED_HOSTS_DEFAULT = "api.openai.com,localhost,127.0.0.1"
+AI_MAX_REQUESTS_PER_SESSION = 40
+AI_MIN_REQUEST_INTERVAL_SEC = 3
+AI_MAX_PROMPT_CHARS = 4000
+AI_MAX_CONTEXT_CHARS = 2500
+AI_CHAT_HISTORY_WINDOW = 8
+AI_TOKEN_STEP = 32
+AI_MAX_SCHEMA_COLUMNS = 20
+AI_FALLBACK_CONTEXT_CHARS = 400
+AI_STREAM_CHUNK_SIZE = 20
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -308,6 +327,16 @@ if "role" not in st.session_state:
     st.session_state.role = None
 if "username" not in st.session_state:
     st.session_state.username = ""
+if "ai_toolbar_enabled" not in st.session_state:
+    st.session_state.ai_toolbar_enabled = False
+if "ai_consent_given" not in st.session_state:
+    st.session_state.ai_consent_given = False
+if "ai_chat_history" not in st.session_state:
+    st.session_state.ai_chat_history = []
+if "ai_requests_count" not in st.session_state:
+    st.session_state.ai_requests_count = 0
+if "ai_last_request_ts" not in st.session_state:
+    st.session_state.ai_last_request_ts = 0.0
 
 CREDENTIALS = {
     "citizen":   ("sentinel123",  "citizen"),
@@ -420,6 +449,217 @@ def month_label(m: int) -> str:
     return months[m - 1] if 1 <= m <= 12 else str(m)
 
 
+def sanitize_text(value: str) -> str:
+    if not value:
+        return ""
+    redacted = re.sub(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*\S+", r"\1=[REDACTED]", value)
+    redacted = re.sub(r"(?i)bearer\s+[a-z0-9\-\._~\+\/]+=*", "Bearer [REDACTED]", redacted)
+    return redacted.strip()
+
+
+def build_ai_context(current_page: str, filtered: pd.DataFrame, include_schema: bool,
+                     include_filters: bool, manual_context: str) -> str:
+    context = {"page": current_page}
+
+    if include_filters:
+        context["active_filters"] = {
+            "month": month_label(int(st.session_state.get("month_filter", 6))),
+            "animal_class": st.session_state.get("animal_filter", "All"),
+            "road_type": st.session_state.get("road_filter", "All"),
+        }
+
+    if not filtered.empty:
+        context["filtered_rows"] = int(len(filtered))
+        if "danger_index" in filtered.columns:
+            context["avg_danger_index"] = round(float(filtered["danger_index"].mean()), 3)
+        if "count" in filtered.columns:
+            context["total_incidents_filtered"] = int(filtered["count"].sum())
+
+    if include_schema and not filtered.empty:
+        schema = []
+        for col in filtered.columns[:AI_MAX_SCHEMA_COLUMNS]:
+            dtype = str(filtered[col].dtype)
+            non_null = int(filtered[col].notna().sum())
+            schema.append({"name": col, "dtype": dtype, "non_null": non_null})
+        context["data_schema"] = schema
+
+    if manual_context:
+        safe_manual = sanitize_text(manual_context)
+        context["user_context"] = safe_manual[:AI_MAX_CONTEXT_CHARS]
+
+    context_json = json.dumps(context, ensure_ascii=False)
+    if len(context_json) <= AI_MAX_CONTEXT_CHARS:
+        return context_json
+
+    context.pop("data_schema", None)
+    context_json = json.dumps(context, ensure_ascii=False)
+    if len(context_json) <= AI_MAX_CONTEXT_CHARS:
+        return context_json
+
+    if "user_context" in context:
+        context["user_context"] = context["user_context"][:AI_FALLBACK_CONTEXT_CHARS]
+    context_json = json.dumps(context, ensure_ascii=False)
+    if len(context_json) <= AI_MAX_CONTEXT_CHARS:
+        return context_json
+
+    minimal = {"page": current_page, "note": "Context trimmed due to size limits."}
+    return json.dumps(minimal, ensure_ascii=False)
+
+
+def is_allowed_ai_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    allow_raw = os.getenv("AI_ALLOWED_HOSTS", AI_ALLOWED_HOSTS_DEFAULT)
+    allowed_hosts = {h.strip().lower() for h in allow_raw.split(",") if h.strip()}
+    return host in allowed_hosts
+
+
+def call_llm(messages: list, max_tokens: int, temperature: float) -> tuple[bool, str]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    base_url = os.getenv("OPENAI_BASE_URL", AI_DEFAULT_BASE_URL).strip()
+    model = os.getenv("OPENAI_MODEL", AI_DEFAULT_MODEL).strip()
+
+    if not api_key:
+        return (
+            False,
+            "AI backend is not configured. Set OPENAI_API_KEY (and optional OPENAI_BASE_URL / OPENAI_MODEL) to enable live responses.",
+        )
+    if not is_allowed_ai_host(base_url):
+        return False, "Configured AI endpoint is not on the allowed host list."
+
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+    payload = json.dumps(body).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    req = Request(base_url, data=payload, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            response_data = json.loads(resp.read().decode("utf-8"))
+            choices = response_data.get("choices", [])
+            if not choices:
+                return False, "AI provider returned no response choices."
+            content = choices[0].get("message", {}).get("content", "").strip()
+            if not content:
+                return False, "AI response was empty."
+            return True, content
+    except HTTPError as e:
+        return False, f"AI request failed: HTTP {e.code}"
+    except URLError:
+        return False, "AI request failed: network error."
+    except Exception as e:
+        return False, f"AI request failed: unexpected error ({type(e).__name__})."
+
+
+def stream_chunks(text: str):
+    for i in range(0, len(text), AI_STREAM_CHUNK_SIZE):
+        yield text[i:i + AI_STREAM_CHUNK_SIZE]
+
+
+def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
+    st.markdown("### AI Toolbar")
+    st.session_state.ai_toolbar_enabled = st.toggle(
+        "Enable assistant",
+        value=st.session_state.ai_toolbar_enabled,
+        help="Toggle AI assistant visibility and interactions.",
+    )
+
+    if not st.session_state.ai_toolbar_enabled:
+        st.caption("Turn on the assistant to ask questions about current dashboard data.")
+        return
+
+    with st.expander("Assistant Panel", expanded=True):
+        st.caption("Privacy: The assistant only uses context you explicitly include.")
+        st.session_state.ai_consent_given = st.checkbox(
+            "I consent to sending selected context to the configured AI provider",
+            value=st.session_state.ai_consent_given,
+        )
+
+        c1, c2 = st.columns(2)
+        include_filters = c1.checkbox("Include filters", value=True)
+        include_schema = c2.checkbox("Include dataset schema", value=False)
+
+        max_tokens = st.slider(
+            "Maximum response length",
+            min_value=128,
+            max_value=800,
+            value=350,
+            step=AI_TOKEN_STEP,
+            help="Higher values allow longer answers but may be slower.",
+        )
+        temperature = st.slider("Creativity", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
+        manual_context = st.text_area(
+            "Optional extra context",
+            height=90,
+            placeholder="Add relevant notes (no passwords, tokens, or credentials).",
+        )
+
+        if st.button("Clear chat", use_container_width=True):
+            st.session_state.ai_chat_history = []
+            st.success("Chat cleared.")
+
+        for msg in st.session_state.ai_chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        prompt = st.chat_input("Ask the AI assistant")
+        if prompt:
+            if not st.session_state.ai_consent_given:
+                st.error("Consent is required before sending any context.")
+                return
+
+            now = time.time()
+            if st.session_state.ai_requests_count >= AI_MAX_REQUESTS_PER_SESSION:
+                st.warning("Session rate limit reached. Clear chat or restart session.")
+                return
+            if now - st.session_state.ai_last_request_ts < AI_MIN_REQUEST_INTERVAL_SEC:
+                st.warning("Please wait a few seconds before sending another request.")
+                return
+
+            safe_prompt = sanitize_text(prompt[:AI_MAX_PROMPT_CHARS]).strip()
+            context_json = build_ai_context(
+                current_page=current_page,
+                filtered=filtered,
+                include_schema=include_schema,
+                include_filters=include_filters,
+                manual_context=manual_context,
+            )
+
+            system_msg = (
+                "You are a wildlife risk analysis assistant. "
+                "Use only the provided context and ask for clarification when missing data."
+            )
+            user_msg = f"Context JSON:\n{context_json}\n\nUser question:\n{safe_prompt}"
+            messages = [{"role": "system", "content": system_msg}] + st.session_state.ai_chat_history[-AI_CHAT_HISTORY_WINDOW:] + [
+                {"role": "user", "content": user_msg}
+            ]
+
+            st.session_state.ai_chat_history.append({"role": "user", "content": safe_prompt})
+
+            with st.chat_message("assistant"):
+                with st.spinner("Generating response..."):
+                    ok, response_text = call_llm(messages, max_tokens=max_tokens, temperature=temperature)
+                if ok:
+                    st.session_state.ai_last_request_ts = now
+                    st.session_state.ai_requests_count += 1
+                    st.write_stream(stream_chunks(response_text))
+                    st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text})
+                else:
+                    fallback = (
+                        f"{response_text}\n\n"
+                        "Fallback guidance: Review current KPIs, heatmap, and selected filters, "
+                        "then ask a focused question like 'summarize top risks this month'."
+                    )
+                    st.warning(fallback)
+                    st.session_state.ai_chat_history.append({"role": "assistant", "content": fallback})
+
+
 # ─────────────────────────────────────────────────────────────
 # LOGIN PAGE
 # ─────────────────────────────────────────────────────────────
@@ -497,6 +737,10 @@ def render_sidebar(df: pd.DataFrame):
         if not df.empty and "roadType" in df.columns:
             road_options += sorted(df["roadType"].dropna().unique().tolist())
         road_type = st.selectbox("Road Type", options=road_options)
+
+        st.session_state.month_filter = month_val
+        st.session_state.animal_filter = animal_class
+        st.session_state.road_filter = road_type
 
         st.markdown("---")
         if st.button("Sign Out", use_container_width=True):
@@ -884,10 +1128,18 @@ def main():
     filtered = apply_filters(df, month_val, animal_class, road_type)
 
     # Route by role
-    if st.session_state.role == "citizen":
-        render_citizen(df, filtered, models)
-    else:
-        render_authority(df, filtered, hotspots, shap_values, feat_names, models)
+    content_col, ai_col = st.columns([4, 1.35], gap="large")
+
+    with content_col:
+        if st.session_state.role == "citizen":
+            render_citizen(df, filtered, models)
+            current_page = "Citizen Dashboard"
+        else:
+            render_authority(df, filtered, hotspots, shap_values, feat_names, models)
+            current_page = "Authority Operations Portal"
+
+    with ai_col:
+        render_ai_toolbar(current_page=current_page, filtered=filtered)
 
 
 if __name__ == "__main__":
