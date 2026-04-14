@@ -50,6 +50,9 @@ AI_MAX_PROMPT_CHARS = 4000
 AI_MAX_CONTEXT_CHARS = 2500
 AI_CHAT_HISTORY_WINDOW = 8
 AI_TOKEN_STEP = 32
+AI_MAX_SCHEMA_COLUMNS = 20
+AI_FALLBACK_CONTEXT_CHARS = 400
+AI_STREAM_CHUNK_SIZE = 20
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -474,7 +477,7 @@ def build_ai_context(current_page: str, filtered: pd.DataFrame, include_schema: 
 
     if include_schema and not filtered.empty:
         schema = []
-        for col in filtered.columns[:20]:
+        for col in filtered.columns[:AI_MAX_SCHEMA_COLUMNS]:
             dtype = str(filtered[col].dtype)
             non_null = int(filtered[col].notna().sum())
             schema.append({"name": col, "dtype": dtype, "non_null": non_null})
@@ -494,7 +497,7 @@ def build_ai_context(current_page: str, filtered: pd.DataFrame, include_schema: 
         return context_json
 
     if "user_context" in context:
-        context["user_context"] = context["user_context"][:400]
+        context["user_context"] = context["user_context"][:AI_FALLBACK_CONTEXT_CHARS]
     context_json = json.dumps(context, ensure_ascii=False)
     if len(context_json) <= AI_MAX_CONTEXT_CHARS:
         return context_json
@@ -555,8 +558,8 @@ def call_llm(messages: list, max_tokens: int, temperature: float) -> tuple[bool,
 
 
 def stream_chunks(text: str):
-    for i in range(0, len(text), 20):
-        yield text[i:i + 20]
+    for i in range(0, len(text), AI_STREAM_CHUNK_SIZE):
+        yield text[i:i + AI_STREAM_CHUNK_SIZE]
 
 
 def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
@@ -642,10 +645,9 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
             with st.chat_message("assistant"):
                 with st.spinner("Generating response..."):
                     ok, response_text = call_llm(messages, max_tokens=max_tokens, temperature=temperature)
-                st.session_state.ai_last_request_ts = now
                 if ok:
+                    st.session_state.ai_last_request_ts = now
                     st.session_state.ai_requests_count += 1
-                if ok:
                     st.write_stream(stream_chunks(response_text))
                     st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text})
                 else:
