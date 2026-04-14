@@ -48,6 +48,7 @@ AI_MAX_REQUESTS_PER_SESSION = 40
 AI_MIN_REQUEST_INTERVAL_SEC = 3
 AI_MAX_PROMPT_CHARS = 4000
 AI_MAX_CONTEXT_CHARS = 2500
+AI_CHAT_HISTORY_WINDOW = 8
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -521,7 +522,10 @@ def call_llm(messages: list, max_tokens: int, temperature: float) -> tuple[bool,
     try:
         with urlopen(req, timeout=30) as resp:
             response_data = json.loads(resp.read().decode("utf-8"))
-            content = response_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            choices = response_data.get("choices", [])
+            if not choices:
+                return False, "AI provider returned no response choices."
+            content = choices[0].get("message", {}).get("content", "").strip()
             if not content:
                 return False, "AI response was empty."
             return True, content
@@ -529,8 +533,8 @@ def call_llm(messages: list, max_tokens: int, temperature: float) -> tuple[bool,
         return False, f"AI request failed: HTTP {e.code}"
     except URLError:
         return False, "AI request failed: network error."
-    except Exception:
-        return False, "AI request failed: unexpected error."
+    except Exception as e:
+        return False, f"AI request failed: unexpected error ({type(e).__name__})."
 
 
 def stream_chunks(text: str):
@@ -591,7 +595,7 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
                 st.warning("Please wait a few seconds before sending another request.")
                 return
 
-            safe_prompt = sanitize_text(prompt[:AI_MAX_PROMPT_CHARS])
+            safe_prompt = sanitize_text(prompt[:AI_MAX_PROMPT_CHARS]).strip()
             context_json = build_ai_context(
                 current_page=current_page,
                 filtered=filtered,
@@ -605,7 +609,7 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
                 "Use only the provided context and ask for clarification when missing data."
             )
             user_msg = f"Context JSON:\n{context_json}\n\nUser question:\n{safe_prompt}"
-            messages = [{"role": "system", "content": system_msg}] + st.session_state.ai_chat_history[-8:] + [
+            messages = [{"role": "system", "content": system_msg}] + st.session_state.ai_chat_history[-AI_CHAT_HISTORY_WINDOW:] + [
                 {"role": "user", "content": user_msg}
             ]
 
