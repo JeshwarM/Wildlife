@@ -555,8 +555,8 @@ def call_llm(messages: list, max_tokens: int, temperature: float) -> tuple[bool,
 
 
 def stream_chunks(text: str):
-    for chunk in text.split():
-        yield chunk + " "
+    for i in range(0, len(text), 20):
+        yield text[i:i + 20]
 
 
 def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
@@ -582,7 +582,14 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
         include_filters = c1.checkbox("Include filters", value=True)
         include_schema = c2.checkbox("Include dataset schema", value=False)
 
-        max_tokens = st.slider("Response token cap", min_value=128, max_value=800, value=350, step=AI_TOKEN_STEP)
+        max_tokens = st.slider(
+            "Maximum response length",
+            min_value=128,
+            max_value=800,
+            value=350,
+            step=AI_TOKEN_STEP,
+            help="Higher values allow longer answers but may be slower.",
+        )
         temperature = st.slider("Creativity", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
         manual_context = st.text_area(
             "Optional extra context",
@@ -631,12 +638,13 @@ def render_ai_toolbar(current_page: str, filtered: pd.DataFrame):
             ]
 
             st.session_state.ai_chat_history.append({"role": "user", "content": safe_prompt})
-            st.session_state.ai_last_request_ts = now
-            st.session_state.ai_requests_count += 1
 
             with st.chat_message("assistant"):
                 with st.spinner("Generating response..."):
                     ok, response_text = call_llm(messages, max_tokens=max_tokens, temperature=temperature)
+                st.session_state.ai_last_request_ts = now
+                if ok:
+                    st.session_state.ai_requests_count += 1
                 if ok:
                     st.write_stream(stream_chunks(response_text))
                     st.session_state.ai_chat_history.append({"role": "assistant", "content": response_text})
